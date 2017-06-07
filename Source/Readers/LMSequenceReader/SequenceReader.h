@@ -16,6 +16,8 @@
 #include <map>
 #include <vector>
 #include <random>
+#include <boost/random/uniform_int_distribution.hpp>
+#include <boost/random/piecewise_constant_distribution.hpp>
 
 namespace Microsoft { namespace MSR { namespace CNTK {
 
@@ -46,11 +48,13 @@ template <typename Count>
 class noiseSampler
 {
     std::vector<double> m_prob, m_log_prob;
-    std::uniform_int_distribution<Count> unif_int;
+    boost::random::uniform_int_distribution<Count> unif_int;
+
     bool uniform_sampling;
     double uniform_prob;
     double uniform_log_prob;
-    std::piecewise_constant_distribution<double> d;
+
+    boost::random::piecewise_constant_distribution<double> d;
     std::mt19937 rng;
 
 public:
@@ -66,8 +70,10 @@ public:
         std::vector<double> vn(counts.size() + 1);
         for (int i = 0; i < vn.size(); i++)
             vn[i] = i;
-        d = std::piecewise_constant_distribution<double>(vn.begin(), vn.end(), counts.begin());
-        unif_int = std::uniform_int_distribution<Count>(0, (long) counts.size() - 1);
+
+        d = boost::random::piecewise_constant_distribution<double>(vn.begin(), vn.end(), counts.begin());
+        unif_int = boost::random::uniform_int_distribution<Count>(0, (long)counts.size() - 1);
+
         m_prob = d.densities();
         m_log_prob.resize(m_prob.size());
         for (int i = 0; i < k; i++)
@@ -109,7 +115,7 @@ public:
 
 // Note: This class is deprecated for standalone use, only used as a base for BatchSequenceReader which overrides most of the functions.
 template <class ElemType>
-class SequenceReader : public IDataReader
+class SequenceReader : public DataReaderBase
 {
 protected:
     bool m_idx2clsRead;
@@ -276,7 +282,7 @@ public:
     }
     virtual ~SequenceReader();
     virtual void StartMinibatchLoop(size_t mbSize, size_t epoch, size_t requestedEpochSamples = requestDataSize);
-    virtual bool GetMinibatch(StreamMinibatchInputs& matrices);
+    virtual bool TryGetMinibatch(StreamMinibatchInputs& matrices);
 
     // void SetSentenceSegBatch(std::vector<size_t> &/*sentenceEnd*/) {};
     // TODO: ^^ should this be   void CopyMBLayoutTo(MBLayoutPtr pMBLayout);
@@ -286,7 +292,10 @@ public:
 
     virtual bool DataEnd();
 
-    //int GetSentenceEndIdFromOutputLabel() { return -1; };
+    size_t GetCurrentSamplePosition() override
+    {
+        return m_mbStartSample;
+    }
 };
 
 template <class ElemType>
@@ -354,7 +363,9 @@ public:
     using Base::mRequestedNumParallelSequences; // IDataReader<ElemType>
 
 private:
-    size_t mLastProcssedSentenceId;
+    unsigned int m_randomSeed = 0; // deterministic random seed
+
+    size_t mLastProcessedSentenceId;
 
     size_t mNumRead;               // number of sentences in current cache block
     vector<bool> mProcessed;       // [mNumRead] true if sequence has already been returned in this cache block
@@ -379,7 +390,8 @@ public:
     BatchSequenceReader()
         : m_pMBLayout(make_shared<MBLayout>())
     {
-        mLastProcssedSentenceId = 0;
+        m_pMBLayout->SetUniqueAxisName(L"LMSequenceReader");
+        mLastProcessedSentenceId = 0;
         mRequestedNumParallelSequences = 1;
         mLastPosInSentence = 0;
         mNumRead = 0;
@@ -404,11 +416,11 @@ private:
 
 public:
     void StartMinibatchLoop(size_t mbSize, size_t epoch, size_t requestedEpochSamples = requestDataSize) override;
-    bool GetMinibatch(StreamMinibatchInputs& matrices) override;
+    bool TryGetMinibatch(StreamMinibatchInputs& matrices) override;
     bool DataEnd() override;
 
     void CopyMBLayoutTo(MBLayoutPtr pMBLayout) { assert(mToProcess.size() == m_pMBLayout->GetNumParallelSequences()); pMBLayout->CopyFrom(m_pMBLayout); }
-    size_t GetNumParallelSequences() override { return mToProcess.size(); } // TODO: or get it from MBLayout? Can this ever be called before GetMinibatch()?
+    size_t GetNumParallelSequencesForFixingBPTTMode() override { return mToProcess.size(); } // TODO: or get it from MBLayout? Can this ever be called before GetMinibatch()?
 
     // TODO: what are these?
     //bool RequireSentenceSeg() const override { return true; }

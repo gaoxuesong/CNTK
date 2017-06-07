@@ -8,119 +8,287 @@
 
 #include "NoRandomizer.h"
 #include "DataReader.h"
+#include "ExceptionCapture.h"
 
 namespace Microsoft { namespace MSR { namespace CNTK {
 
-NoRandomizer::NoRandomizer(IDataDeserializerPtr deserializer)
+    NoRandomizer::NoRandomizer(IDataDeserializerPtr deserializer, bool multithreadedGetNextSequences, size_t maxNumberOfInvalidSequences)
     : m_deserializer(deserializer),
-      m_samplePositionInEpoch(0),
-      m_sequencePosition(0)
+      m_currentChunkPosition(CHUNKID_MAX),
+      m_globalSamplePosition(0),
+      m_globalSequencePosition(0),
+      m_sweepSizeInSamples(0),
+      m_currentSequencePositionInChunk(0),
+      m_multithreadedGetNextSequences(multithreadedGetNextSequences),
+      m_cleaner(maxNumberOfInvalidSequences)
 {
     assert(deserializer != nullptr);
+    m_streams = m_deserializer->GetStreamDescriptions();
+    m_chunkDescriptions = m_deserializer->GetChunkDescriptions();
 
-    m_timeline = m_deserializer->GetSequenceDescriptions();
-    for (const auto& sequence : m_timeline)
+    size_t sampleCount = 0;
+    for (const auto& chunk : m_chunkDescriptions)
     {
-        if (sequence->m_numberOfSamples != 1)
-        {
-            RuntimeError("Currently, no randomizer supports only frame mode. Received a sequence with %d number of samples.",
-                static_cast<int>(sequence->m_numberOfSamples));
-        }
+        // Check that position corresponds to chunk id.
+        assert(m_chunkSampleOffset.size() == chunk->m_id);
+
+        m_chunkSampleOffset.push_back(sampleCount);
+        sampleCount += chunk->m_numberOfSamples;
     }
 
-    m_streams = m_deserializer->GetStreamDescriptions();
+    if (sampleCount == 0)
+    {
+        RuntimeError("NoRandomizer: Expected input to contain samples, but the number of successfully read samples was 0.");
+    }
+
+    m_sweepSizeInSamples = sampleCount;
 }
 
-void NoRandomizer::Initialize(TransformerPtr, const ConfigParameters&)
+ChunkIdType NoRandomizer::GetChunkIndexOf(size_t samplePosition)
 {
+    auto result = std::upper_bound(m_chunkSampleOffset.begin(), m_chunkSampleOffset.end(), samplePosition);
+    return (ChunkIdType) (result - 1 - m_chunkSampleOffset.begin());
 }
 
 void NoRandomizer::StartEpoch(const EpochConfiguration& config)
 {
     m_config = config;
 
-    if (m_config.m_totalEpochSizeInSamples == requestDataSize)
+    if (config.m_totalEpochSizeInSweeps != g_infinity)
     {
-        m_config.m_totalEpochSizeInSamples = m_timeline.size();
+        m_config.m_totalEpochSizeInSamples = m_sweepSizeInSamples * config.m_totalEpochSizeInSweeps;
+    }
+    else if (m_config.m_totalEpochSizeInSamples == requestDataSize)
+        m_config.m_totalEpochSizeInSamples = m_sweepSizeInSamples;
+
+    SetCurrentSamplePosition(m_config.m_totalEpochSizeInSamples * config.m_epochIndex);
+}
+
+// Moving the cursor to the next sequence. Possibly updating the chunk information if needed.
+void NoRandomizer::MoveToNextSequence()
+{
+    if (m_currentSequencePositionInChunk + 1 >= m_chunkDescriptions[m_currentChunkPosition]->m_numberOfSequences)
+    {
+        // Moving to the next chunk.
+        m_currentChunkPosition = (m_currentChunkPosition + 1) % m_chunkDescriptions.size();
+        m_currentSequencePositionInChunk = 0;
+        m_sequenceWindow.clear();
+        m_deserializer->GetSequencesForChunk(m_currentChunkPosition, m_sequenceWindow);
+    }
+    else
+    {
+        m_currentSequencePositionInChunk++;
+    }
+}
+
+// Gets next sequences not exceeding local and global samples.
+void NoRandomizer::GetNextSequenceDescriptions(size_t numGlobalSamplesToLoad, size_t numLocalSamplesToLoad, Sequences& result)
+{
+    assert(numGlobalSamplesToLoad != 0);
+    assert(numLocalSamplesToLoad != 0);
+
+    if (numGlobalSamplesToLoad > std::numeric_limits<int>::max() &&
+        numLocalSamplesToLoad > std::numeric_limits<int>::max())
+        RuntimeError("Global and local size of the minibatch cannot exceed max int.");
+
+    assert(m_sequenceWindow.size() != 0);
+    assert(m_chunkDescriptions[m_currentChunkPosition]->m_numberOfSequences > m_currentSequencePositionInChunk);
+
+    size_t numGlobalSamplesLoaded = 0, numLocalSamplesLoaded = 0, endOfEpochPosition = GetEndOfEpochPosition();
+
+    bool atLeastOneSequenceNeeded = true;
+
+    auto sweepIndex = m_globalSamplePosition / m_sweepSizeInSamples;
+    m_sequenceBuffer.clear();
+
+    while (numGlobalSamplesLoaded < numGlobalSamplesToLoad  && numLocalSamplesLoaded < numLocalSamplesToLoad)
+    {
+        const SequenceDescription& sequence = m_sequenceWindow[m_currentSequencePositionInChunk];
+        auto sequenceLength = sequence.m_numberOfSamples;
+
+        // Let's check whether we need to return this sequence or skip it.
+        bool isLocal = m_globalSequencePosition % m_config.m_numberOfWorkers == m_config.m_workerRank;
+
+        if (!atLeastOneSequenceNeeded) 
+        {
+            // Break if we're exceeding the global requested sample count.
+            if (numGlobalSamplesLoaded + sequenceLength > numGlobalSamplesToLoad)
+                break;
+
+            // Break if we're exceeding the local requested sample count.
+            if (isLocal && numLocalSamplesLoaded + sequenceLength > numLocalSamplesToLoad)
+                break;
+        }
+        
+        if (m_globalSamplePosition >= endOfEpochPosition) 
+        {
+            result.m_endOfEpoch = true;
+            result.m_endOfSweep = (sweepIndex != (m_globalSamplePosition) / m_sweepSizeInSamples);
+            break;
+        }
+
+        if (isLocal) // Ok good to add it to the result.
+        {
+            m_sequenceBuffer.push_back(sequence);
+            numLocalSamplesLoaded += sequenceLength;
+            atLeastOneSequenceNeeded = false;
+        }
+
+        numGlobalSamplesLoaded += sequenceLength;
+        m_globalSamplePosition += sequenceLength;
+        m_globalSequencePosition++;
+
+        MoveToNextSequence();
     }
 
-    m_samplePositionInEpoch = 0;
-    size_t globalSamplePosition = m_config.m_totalEpochSizeInSamples * config.m_epochIndex;
-    m_sequencePosition = globalSamplePosition % m_timeline.size();
-};
+    // Set the end-of-epoch flag (true when the current batch is last in an epoch).
+    result.m_endOfEpoch |= (m_globalSamplePosition >= endOfEpochPosition);
+    result.m_endOfSweep |= sweepIndex != m_globalSamplePosition / m_sweepSizeInSamples;
+}
 
-Sequences NoRandomizer::GetNextSequences(size_t sampleCount)
+size_t NoRandomizer::GetCurrentSamplePosition()
 {
+    return m_globalSamplePosition;
+}
+
+Sequences NoRandomizer::GetNextSequences(size_t globalSampleCount, size_t localSampleCount)
+{
+    if (globalSampleCount == 0)
+        LogicError("Global sample count must not be zero.");
+
+    if (localSampleCount == 0)
+        LogicError("Local sample count must not be zero.");
+
     Sequences result;
-    if (m_config.m_totalEpochSizeInSamples <= m_samplePositionInEpoch)
+    size_t endOfEpochPosition = GetEndOfEpochPosition();
+    if (m_globalSamplePosition >= endOfEpochPosition)
     {
         result.m_endOfEpoch = true;
+        result.m_endOfSweep = (m_globalSamplePosition >= m_sweepSizeInSamples) &&
+            (m_globalSamplePosition % m_sweepSizeInSamples == 0);
         return result;
     }
 
-    size_t maxSampleCount = std::min(sampleCount, m_config.m_totalEpochSizeInSamples - m_samplePositionInEpoch);
-    size_t start = maxSampleCount * m_config.m_workerRank / m_config.m_numberOfWorkers;
-    size_t end = maxSampleCount * (m_config.m_workerRank + 1) / m_config.m_numberOfWorkers;
-    size_t subsetSize = end - start;
-
-    std::vector<size_t> chunkIds;
-    SequenceDescriptions sequences;
-    sequences.reserve(subsetSize);
-    size_t previousChunk = SIZE_MAX;
-    for (size_t i = start; i < end; ++i)
+    if (!m_config.m_allowMinibatchesToCrossSweepBoundaries)
     {
-        const auto& sequence = m_timeline[(m_sequencePosition + i) % m_timeline.size()];
-        assert(sequence->m_numberOfSamples == 1);
-        sequences.push_back(sequence);
-
-        if (previousChunk != sequence->m_chunkId)
-        {
-            chunkIds.push_back(sequence->m_chunkId);
-            previousChunk = sequence->m_chunkId;
-        }
+        // Cut down the required sample count if we're not allowed to go over the
+        // sweep boundary
+        size_t sweepPosition = m_globalSamplePosition % m_sweepSizeInSamples;
+        globalSampleCount = std::min(globalSampleCount, m_sweepSizeInSamples - sweepPosition);
     }
 
-    m_samplePositionInEpoch += maxSampleCount;
-    m_sequencePosition = (m_sequencePosition + maxSampleCount) % m_timeline.size();
+    if (globalSampleCount == 0)
+        LogicError("Global sample count must not result in zero.");
 
-    if (sequences.size() == 0)
+    GetNextSequenceDescriptions(globalSampleCount, localSampleCount, result);
+
+    if (m_sequenceBuffer.size() == 0)
     {
         return result;
     }
 
-    // TODO: Currently we preserve chunks not for the complete window, only for minibatch
-    // Should be changed
-    std::map<size_t, ChunkPtr> chunks;
-    for (size_t id : chunkIds)
+    result.m_data.resize(m_streams.size(), std::vector<SequenceDataPtr>(m_sequenceBuffer.size()));
+
+    // Collect all the chunks that we need
+    std::map<ChunkIdType, ChunkPtr> chunks;
+    for (const auto& s : m_sequenceBuffer)
     {
-        auto chunk = m_chunks.find(id);
-        if (chunk == m_chunks.end())
+        auto it = chunks.find(s.m_chunkId);
+        if (it == chunks.end())
         {
-            chunks[id] = m_deserializer->GetChunk(id);
-        }
-        else
-        {
-            chunks[id] = chunk->second;
+            auto old = m_chunks.find(s.m_chunkId);
+            if (old != m_chunks.end())
+            {
+                chunks.insert(std::make_pair(s.m_chunkId, old->second));
+            }
+            else
+            {
+                chunks[s.m_chunkId] = m_deserializer->GetChunk(s.m_chunkId);
+            }
         }
     }
 
+    // swap current chunks with new ones:
     m_chunks.swap(chunks);
 
-    // TODO: Not clear whether batching will make sense for this.
-    // We have to re-assemble the exposed result from sequences from different chunks.
-    result.m_data.resize(m_streams.size(), std::vector<SequenceDataPtr>(sequences.size()));
+    auto process = [&](int i) -> void {
+        std::vector<SequenceDataPtr> sequence;
+        const auto& sequenceDescription = m_sequenceBuffer[i];
 
-#pragma omp parallel for ordered schedule(dynamic)
-    for (int i = 0; i < sequences.size(); ++i)
-    {
-        auto sequence = m_chunks[sequences[i]->m_chunkId]->GetSequence(sequences[i]->m_id);
+        auto it = m_chunks.find(sequenceDescription.m_chunkId);
+        if (it == m_chunks.end())
+        {
+            LogicError("Invalid chunk requested.");
+        }
 
+        it->second->GetSequence(sequenceDescription.m_indexInChunk, sequence);
         for (int j = 0; j < m_streams.size(); ++j)
         {
             result.m_data[j][i] = sequence[j];
         }
+    };
+
+    // TODO: This will be changed, when we move transformers under the (no-) randomizer, should not deal with multithreading here.
+    if (m_multithreadedGetNextSequences)
+    {
+        ExceptionCapture capture;
+#pragma omp parallel for schedule(dynamic)
+        for (int i = 0; i < m_sequenceBuffer.size(); ++i)
+            capture.SafeRun(process, i);
+        capture.RethrowIfHappened();
     }
+    else
+    {
+        for (int i = 0; i < m_sequenceBuffer.size(); ++i)
+            process(i);
+    }
+
+    m_cleaner.Clean(result);
     return result;
+}
+
+void NoRandomizer::SetCurrentSamplePosition(size_t samplePosition)
+{
+    m_currentSequencePositionInChunk = 0;
+    m_globalSamplePosition = samplePosition;
+    size_t sweepSamplePosition = m_globalSamplePosition % m_sweepSizeInSamples;
+
+    ChunkIdType chunkIndex = GetChunkIndexOf(sweepSamplePosition);
+    if (chunkIndex != m_currentChunkPosition)
+    {
+        // Need to load descriptions for the new current chunk.
+        m_currentChunkPosition = chunkIndex;
+        m_currentSequencePositionInChunk = 0;
+        m_sequenceWindow.clear();
+        m_deserializer->GetSequencesForChunk(m_currentChunkPosition, m_sequenceWindow);
+    }
+
+    // Moving current sequence inside the chunk to match the sample offset.
+    // Currently linear, happens only at the border of epochs.
+    size_t sampleOffsetInsideChunk = sweepSamplePosition - m_chunkSampleOffset[m_currentChunkPosition];
+    size_t numberOfSamples = 0;
+    while (m_currentSequencePositionInChunk < m_sequenceWindow.size() &&
+        numberOfSamples < sampleOffsetInsideChunk)
+    {
+        numberOfSamples += m_sequenceWindow[m_currentSequencePositionInChunk].m_numberOfSamples;
+        MoveToNextSequence();
+    }
+
+    // Updating the global position
+    m_globalSamplePosition = m_globalSamplePosition - sampleOffsetInsideChunk + numberOfSamples;
+    assert(m_chunkDescriptions[m_currentChunkPosition]->m_numberOfSequences > m_currentSequencePositionInChunk);
+
+    m_globalSequencePosition = 0;
+    for (size_t i = 0; i < m_currentChunkPosition; ++i)
+    {
+        m_globalSequencePosition += m_chunkDescriptions[i]->m_numberOfSequences;
+    }
+    m_globalSequencePosition += m_currentSequencePositionInChunk;
+}
+
+void NoRandomizer::SetConfiguration(const ReaderConfiguration& config)
+{
+    *((ReaderConfiguration*)&m_config) = config;
 }
 
 } } }

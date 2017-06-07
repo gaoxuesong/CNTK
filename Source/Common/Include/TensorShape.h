@@ -79,7 +79,7 @@ namespace Microsoft { namespace MSR { namespace CNTK {
 //     - special case: swapping between sample and MBLayout, e.g. turn a sample dimension to a time dimension
 //  - Validate() stage will automatically infer tensor dimensions from inputs, and also infer downwards into LearnableParameters where requested
 //
-// Interfacing to and inplementation in Matrix lib:
+// Interfacing to and implementation in Matrix lib:
 //  - a Tensor is realized as a type TensorView = { Matrix&, TensorShape& } (i.e. tensors don't own their memory)
 //  - Matrix lib will contain overloads for relevant operations that take Tensor& instead of Matrix&.
 //  - elementwise ops will go through a single bottleneck function that deals with matching dimensions (extend, broadcast) and flattening
@@ -91,10 +91,11 @@ class SmallVector
     T m_data[12];
     size_t m_size;
 #ifdef _DEBUG
-    void DebugWipe()
+    static const char defaultUnusedValue = std::numeric_limits<T>::is_signed ? -1 : 0;
+    void DebugWipe() // initialize to 0 or -1 to make it easier to parse visually in a debugger
     {
-        memset(m_data, 0, sizeof(m_data));
-    } // initialize to 0 to make it look prettier in the debugger
+        memset(m_data, defaultUnusedValue, sizeof(m_data));
+    }
 #else
     void DebugWipe()
     {
@@ -122,6 +123,15 @@ public:
         if (m_size >= capacity())
             LogicError("SmallVector: push_back() exceeded capacity of %d", (int) capacity());
         m_data[m_size++] = val;
+    }
+    void pop_back()
+    {
+        if (m_size == 0)
+            LogicError("SmallVector: pop_back() called on empty vector");
+        m_size--;
+#ifdef _DEBUG
+        m_data[m_size] = (T)defaultUnusedValue; // make this easier to parse in the debugger
+#endif
     }
     void resize(size_t sz, const T& val)
     {
@@ -332,6 +342,10 @@ public:
 struct TensorShape
 {
 public:
+    // -----------------------------------------------------------------------
+    // construction
+    // -----------------------------------------------------------------------
+
     // main constructor (from vector that holds dimensions)
     template <size_t N>
     TensorShape(const std::array<size_t, N>& dims)
@@ -363,6 +377,8 @@ public:
         InitAsNoSlice();
     }
 
+    inline static TensorShape Scalar(bool isV2Library) { return isV2Library ? TensorShape() : TensorShape(1); }
+
     // boilerplate
     bool operator==(const TensorShape& other) const { return m_dims == other.m_dims; }
     bool operator!=(const TensorShape& other) const { return !operator==(other); } // duh!
@@ -378,6 +394,8 @@ public:
         }
     }
 
+    // TODO: move the methods in this region under their respective headline
+    // TODO: overload the << and >> operators for serializing TensorShape
     void Save(File& fstream) const
     {
         VerifyIsDense();
@@ -395,12 +413,16 @@ public:
     {
         // format: uint32_t n, dim[0], dim[1], ..., dim[n-1]
         // We are also able to read (but not write) an older format, which stores 3-dimensional tensors as size_t W, H, C
-        uint32_t rank, dim0;
-        fstream >> rank >> dim0;
+        uint32_t rank;
+        uint32_t dim0 = 0;
+        fstream >> rank;
+        if (rank > 0)
+            fstream >> dim0;
         if (!acceptLegacyFormat || dim0 != 0) // heuristic to detect the old format. Old format stores a size_t, i.e. the second uint32_t is 0 (no dimensions are > 4G)
         {
             m_dims.resize(rank);
-            m_dims[0] = dim0;
+            if (rank > 0)
+                m_dims[0] = dim0;
             for (size_t i = 1; i < rank; i++)
             {
                 fstream >> dim0;
@@ -418,14 +440,17 @@ public:
         return *this;
     }
 
+    // -----------------------------------------------------------------------
     // accessors
+    // -----------------------------------------------------------------------
+
     size_t GetDim(size_t k) const { return m_dims[k]; }
     size_t GetDimPadded(size_t k) const { return k < GetRank() ? GetDim(k) : 1; }   // like GetDim() but return 1 for extra (out of bounds) dimensions
     size_t GetRank() const { return m_dims.size(); }
     size_t GetNumElements() const
     {
         if (m_dims.empty())
-            return 0;
+            return 1;
         size_t res = 1;
         for (auto& dim : m_dims)
             res *= dim;
@@ -448,6 +473,7 @@ public:
     const SmallVector<ptrdiff_t>& GetStrides() const { return m_strides; }
 
     // test whether the tensor represents a column vector (but allowing added broadcasting dimensions)
+    // A tensor represents a column vector when all dimensions except the leading are 1.
     bool IsColumnVector() const
     {
         for (size_t k = 1; k < size(); k++)
@@ -455,13 +481,11 @@ public:
                 return false;
         return true;
     }
-    // legacy helper function for RowSliceNode. Will go away.
-    bool IsVectorStoredAsImage() const
-    {
-        return GetRank() == 3 && m_dims[0] == 1 && m_dims[1] == 1;
-    }
 
+    // -----------------------------------------------------------------------
     // indexing
+    // -----------------------------------------------------------------------
+
     // Determines the offset into the underlying element array for a given multi-dimensional index.
     // This function is for reference. Probably not often used.
     size_t Locate(const SmallVector<size_t>& index) const
@@ -496,7 +520,10 @@ public:
         return result;
     }
 
+    // -----------------------------------------------------------------------
     // helpers for tensor operations
+    // -----------------------------------------------------------------------
+
     bool CanFlatten(size_t k) const // can dims k and k-1 be flattened into a single vector? (do they form a matrix without stride)
     {
         if (k == 0)
@@ -508,9 +535,13 @@ public:
         else
             return m_strides[k] == m_strides[k - 1] * (ptrdiff_t) m_dims[k - 1];
     }
+
+    // -----------------------------------------------------------------------
     // editing functions for tensor operations
-    // Unlike other methods, these are in-place.
-    TensorShape& FlattenInPlace(size_t k) // flatten [k] with [k-1]. Dim[k-1] will be absorbed into [k] and set to 1.
+    // -----------------------------------------------------------------------
+
+    // flatten [k] with [k-1]. Dim[k-1] will be absorbed into [k] and set to 1.
+    TensorShape& FlattenInPlace(size_t k)
     {
         if (!CanFlatten(k))
             LogicError("Flatten() cannot flatten dimensions with gaps");
@@ -566,25 +597,35 @@ public:
                 m_strides[k] = 0;
         return *this;
     }
-    TensorShape& PadRankInPlace(size_t desiredRank) // append singleton dimensions
+    TensorShape& PadRankInPlace(size_t desiredRank) // append trailing singleton dimensions
     {
         VerifyIsDense();
-        if (desiredRank < GetRank())
-            LogicError("Pad() cannot drop a shorten the dimensions.");
-        else
-            while (GetRank() < desiredRank)
-            {
-                m_strides.push_back(GetRank() > 0 ? m_strides.back() * (ptrdiff_t) m_dims.back() : 1);
-                m_dims.push_back(1);
-            }
+        if (desiredRank < GetRank()) // can't drop
+            LogicError("PadRankInPlace: desiredRank (%d) cannot be less than tensor shape's rank (%d)", (int)desiredRank, (int)GetRank());
+        else while (GetRank() < desiredRank) // pad
+        {
+            m_strides.push_back(GetRank() > 0 ? m_strides.back() * (ptrdiff_t)m_dims.back() : 1);
+            m_dims.push_back(1);
+        }
+        return *this;
+    }
+    TensorShape& TrimRankInPlace(size_t desiredRank) // drop trailing singleton dimensions
+    {
+        if (GetRank() < desiredRank) // can't pad
+            LogicError("TrimRankInPlace: desiredRank (%d) cannot be higher than tensor shape's rank (%d)", (int)desiredRank, (int)GetRank());
+        else while (desiredRank < GetRank()) // drop
+        {
+            if (m_dims.back() != 1)
+                LogicError("TrimRankInPlace() cannot drop non-singleton dimensions.");
+            m_strides.pop_back();
+            m_dims.pop_back();
+        }
+        VerifyIsDense(); // (should be OK to drop non-dense singleton dimensions, so check after dropping them)
         return *this;
     }
     TensorShape PadRank(size_t desiredRank) const // append singleton dimensions
     {
-        // TODO: simplify to: return TensorShape(*this).PadRankInPlace(desiredRank);
-        TensorShape result(*this);
-        result.PadRankInPlace(desiredRank);
-        return result;
+        return TensorShape(*this).PadRankInPlace(desiredRank);
     }
     TensorShape& AppendInPlace(size_t rank, size_t newDim) // concatenate one new dimension at position 'rank'
     {
@@ -597,9 +638,7 @@ public:
     }
     TensorShape Append(size_t rank, size_t newDim) const
     {
-        TensorShape result(*this);
-        result.AppendInPlace(rank, newDim);
-        return result;
+        return TensorShape(*this).AppendInPlace(rank, newDim);
     }
     // narrow a dimension k to given bounds [begin, end), done in-place
     TensorShape& NarrowTo(size_t k, size_t begin, size_t end)
@@ -622,14 +661,65 @@ public:
             NarrowTo(k, (size_t)bounds.first[k], (size_t)bounds.second[k]);
         return *this;
     }
+
     // swap two existing dimensions (implements transposition)
     // This yields the same tensor but index positions are exchanged.
+    // This tensor is now no longer stored as column-major.
     void SwapDimsInPlace(size_t i, size_t j)
     {
         if (i == j) // this is OK
             return;
         std::swap(m_dims[i],    m_dims[j]);
         std::swap(m_strides[i], m_strides[j]);
+    }
+
+    // permute existing dimensions (implements generalized transposition)
+    // This tensor is now no longer stored as column-major.
+    void PermuteDimsInPlace(const std::vector<size_t>& permutation)
+    {
+        auto m_dims_copy = m_dims;
+        auto m_strides_copy = m_strides;
+        auto size = permutation.size();
+        for (auto i = 0; i < size; ++i) 
+        {
+            m_dims[i] = m_dims_copy[permutation[i]];
+            m_strides[i] = m_strides_copy[permutation[i]];
+        }
+    }
+
+    // Flatten a tensor shape into a 2D tensor, where splitPoint is the first index to go into the second dimension
+    // The tensor shape must be flattenable this way, i.e. each of the two index ranges must be dense.
+    void FlattenTo2DInPlace(size_t splitPoint, const char* errorPrefix/* = nullptr*/)
+    {
+        // check & print meaningful error message
+        SmallVector<bool> dimsToDrop(GetRank(), false);
+        for (size_t k = 1; k < GetRank(); k++)
+            if (k != splitPoint)
+                if (!CanFlatten(k))
+                    InvalidArgument("%sShape [%s] is not dense at dimension %d.", (errorPrefix != nullptr) ? (std::string(errorPrefix) + ": ").c_str() : "", string(*this).c_str(), (int)k);
+                else
+                    dimsToDrop[k - 1] = true;
+        // handle case where last dimension missing, e.g. u'v where u and v are column vectors
+        if (splitPoint == GetRank())
+        {
+            PadRankInPlace(splitPoint + 1);
+            dimsToDrop.resize(splitPoint + 1, false);
+        }
+        // flatten the dimensions
+        for (size_t k = 1; k < GetRank(); k++)
+            if (dimsToDrop[k - 1])
+                FlattenInPlace(k);
+        DropDimsInPlace(dimsToDrop);
+        // handle edge case where first dimension missing, e.g. u'v where both are scalars
+        if (splitPoint == 0)
+        {
+            // we must insert a 1 dimension at the start
+            assert(GetRank() == 1); // we have reduced everything after the split point at this point
+            PadRankInPlace(2);      // append a 1
+            SwapDimsInPlace(0, 1);  // and swap--this preserves the stride of the second dimension
+        }
+        // now we have a matrix
+        assert(GetRank() == 2);
     }
 
     // compare two TensorShapes, whether they are compatible, considering padding and broadcasting
@@ -655,7 +745,7 @@ public:
                 s.append(" x ");
             s.append(std::to_string(m_dims[k]));
         }
-#ifdef _DEBUG // also emit the strides, easier for debugging
+#if 0   // also emit the strides, easier for debugging
         s.append(" {");
         for (size_t k = 0; k < size(); k++)
         {
@@ -668,15 +758,22 @@ public:
         return s;
     }
 
+    // pretty-printing, wstring version 
+    operator std::wstring() const
+    {
+        std::string s = this->operator std::string(); 
+        return msra::strfun::utf16(s);
+    }
+
 private:
-    // reset m_strides and m_offset to represent a canonical no-strides tensor
+    // reset m_strides and m_offset to represent a canonical no-strides column-major tensor
     void InitAsNoSlice()
     {
         m_offset = 0;
         m_strides.resize(m_dims.size());
         for (size_t k = 0; k < m_dims.size(); k++)
             m_strides[k] = k > 0 ? m_strides[k - 1] * (ptrdiff_t) m_dims[k - 1] : 1;
-        m_allocation = m_dims.empty() ? 0 : m_dims.back() * (size_t) m_strides.back(); // TODO: Or should an empty shape mean it's a scalar?
+        m_allocation = m_dims.empty() ? 1 : m_dims.back() * (size_t) m_strides.back(); // TODO: Or should an empty shape mean it's a scalar?
     }
 
 private:
@@ -684,8 +781,9 @@ private:
     SmallVector<ptrdiff_t> m_strides; // dimension gets multiplied by this for computing the index offset. How to hop to the next element in dimension[k]. Stride magic happening here!
     size_t m_offset;                  // offset to element(0,0,...,0). May be non-0 in case of slicing.
     size_t m_allocation;              // allocation size of original dense tensor
-    // For a regular tensor, there are no strides, m_strides[k] = m_strides[k-1] * m_dims[k-1]. This is how TensorShapes are created from dimensions.
-    // For views into existing tensors, we do stride shenanigans to implement broadcasting (plus magic tricks). Examples:
+
+    // A regular tensor is column-major without extra strides: m_strides[k] = m_strides[k-1] * m_dims[k-1]. This is how TensorShapes are created from dimensions.
+    // For views into existing tensors, this class allows stride shenanigans to implement broadcasting (plus magic tricks). Examples:
     // To traverse a 5 x 10 matrix with column order reversed:
     //  - op.dims = (5 x 10)
     //  - m_offset points to element (0,9)
@@ -746,6 +844,11 @@ static inline ImageLayoutKind ImageLayoutKindFrom(const wstring& s)
 struct ImageDimensions
 {
     size_t m_width, m_height, m_numChannels;
+    // convenience accessors. TODO: use only one name. Rename the members themselves?
+    size_t w() const { return m_width;       }
+    size_t h() const { return m_height;      }
+    size_t c() const { return m_numChannels; }
+
     // interpret TensorShape as image
     ImageDimensions(const TensorShape& shape, ImageLayoutKind imageLayoutKind)
     {
@@ -753,14 +856,14 @@ struct ImageDimensions
             InvalidArgument("Convolution operation currently only supports 1D or 2D convolution on 3D tensors.");
         if (imageLayoutKind == ImageLayoutKind::CHW)
         {
-            m_width = shape[0];
-            m_height = shape[1];
+            m_width       = shape[0];
+            m_height      = shape[1];
             m_numChannels = shape[2];
         }
         else if (imageLayoutKind == ImageLayoutKind::HWC)
         {
-            m_width = shape[1];
-            m_height = shape[2];
+            m_width      = shape[1];
+            m_height     = shape[2];
             m_numChannels = shape[0];
         }
         else
@@ -785,4 +888,5 @@ struct ImageDimensions
         return AsTensorShape(m_width, m_height, m_numChannels, imageLayoutKind);
     }
 };
-} } }
+
+}}}

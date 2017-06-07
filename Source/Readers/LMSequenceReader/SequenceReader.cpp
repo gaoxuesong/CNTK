@@ -660,7 +660,7 @@ void SequenceReader<ElemType>::ReadClassInfo(const wstring& vocfile, int& classS
 
     // check if unk is the same used in vocabulary file
     if (word4idx.find(mUnk.c_str()) == word4idx.end())
-        RuntimeError("ReadClassInfo unknown symbol '%s' is not in vocabulary file.", mUnk.c_str());
+        fprintf(stderr, "ReadClassInfo: 'unknown' symbol unk='%s' is not in vocabulary file. Unknown words will error out if encountered.\n", mUnk.c_str());
 }
 
 // InitCache - Initialize the caching reader if cache files exist, otherwise the writer
@@ -983,7 +983,7 @@ bool SequenceReader<ElemType>::SentenceEnd()
 /// the fourth row is the ending index + 1 of the class for this word
 template <class ElemType>
 void SequenceReader<ElemType>::GetLabelOutput(StreamMinibatchInputs& matrices,
-                                              size_t m_mbStartSample, size_t actualmbsize)
+                                              size_t mbStartSample, size_t actualmbsize)
 {
     FailBecauseDeprecated(__FUNCTION__);    // DEPRECATED CLASS, SHOULD NOT BE USED ANYMORE
 
@@ -1000,7 +1000,7 @@ void SequenceReader<ElemType>::GetLabelOutput(StreamMinibatchInputs& matrices,
     else if (readerMode == ReaderMode::Softmax)
         labels.Resize(1, actualmbsize);
 
-    for (size_t jSample = m_mbStartSample; j < actualmbsize; ++j, ++jSample)
+    for (size_t jSample = mbStartSample; j < actualmbsize; ++j, ++jSample)
     {
         // pick the right sample with randomization if desired
         size_t jRand = jSample;
@@ -1138,7 +1138,7 @@ void SequenceReader<ElemType>::GetClassInfo()
 }
 
 template <class ElemType>
-bool SequenceReader<ElemType>::GetMinibatch(StreamMinibatchInputs& matrices)
+bool SequenceReader<ElemType>::TryGetMinibatch(StreamMinibatchInputs& matrices)
 {
     FailBecauseDeprecated(__FUNCTION__);    // DEPRECATED CLASS, SHOULD NOT BE USED ANYMORE
 
@@ -1506,6 +1506,7 @@ void BatchSequenceReader<ElemType>::InitFromConfig(const ConfigRecordType& reade
             }
             else
             {
+                fprintf(stderr, "LMSequenceReader: Label mapping will be created internally on the fly because the labelMappingFile was not found: %ls\n", labelPath.c_str());
                 if (wClassFile != L"")
                 {
 #if 0
@@ -1538,6 +1539,7 @@ void BatchSequenceReader<ElemType>::InitFromConfig(const ConfigRecordType& reade
                 }
                 labelInfo.mapName = labelPath;
                 labelInfo.fileToWrite = labelPath; // mapping path denotes an output: write the mapping here at the end
+                // BUGBUG: This facility is not functional. No file is being created.
             }
         }
 
@@ -1578,7 +1580,7 @@ void BatchSequenceReader<ElemType>::Reset()
 {
     mProcessed.clear();
     mToProcess.clear();
-    mLastProcssedSentenceId = 0;
+    mLastProcessedSentenceId = 0;
     mPosInSentence = 0;
     mLastPosInSentence = 0;
     mNumRead = 0;
@@ -1651,6 +1653,7 @@ void BatchSequenceReader<ElemType>::StartMinibatchLoop(size_t mbSize, size_t epo
     // we use epochSize, which might not be set yet, so use a default value for allocations if not yet set
     size_t epochSize = m_epochSize == requestDataSize ? 1000 : m_epochSize;
     m_epoch = epoch;
+    m_randomSeed = (unsigned int)m_epoch;
     m_mbStartSample = epoch * m_epochSize;
     m_epochSamplesReturned = 0;     // counter to know when we returned one epoch
 
@@ -1700,7 +1703,7 @@ size_t BatchSequenceReader<ElemType>::DetermineSequencesToProcess()
             int mp = (int) mToProcess[s];
             if (mProcessed[mp])
             {
-                mLastProcssedSentenceId = mp;
+                mLastProcessedSentenceId = mp;
                 mLastPosInSentence = 0;
                 allDone = true;
                 break;
@@ -1722,7 +1725,7 @@ size_t BatchSequenceReader<ElemType>::DetermineSequencesToProcess()
     size_t maxToProcess = mRequestedNumParallelSequences > 0 ? mRequestedNumParallelSequences : SIZE_MAX; // if mRequestedNumParallelSequences is 0 then we go by MB size
     size_t maxTokens    = mRequestedNumParallelSequences > 0 ?                       SIZE_MAX : m_mbSize;
     size_t numTokens = 0;  // token counter
-    for (size_t seq = mLastProcssedSentenceId;
+    for (size_t seq = mLastProcessedSentenceId;
          seq < mNumRead &&                 // hit end of buffer
          mToProcess.size() < maxToProcess; // hit parallel-sequence limit
          seq++)
@@ -1747,8 +1750,9 @@ size_t BatchSequenceReader<ElemType>::DetermineSequencesToProcess()
         // and count tokens
         numTokens += m_parser.mSentenceIndex2SentenceInfo[seq].sLen;
     }
-    // if all are already done, we will return sln=0
-    fprintf(stderr, "DetermineSequencesToProcess: %d sequences of len %d, %d tokens\n", (int) mToProcess.size(), (int) sln, (int) numTokens);
+    // if all were already done, we will get here with sln=0 and return that
+
+    //fprintf(stderr, "DetermineSequencesToProcess: %d sequences of len %d, %d tokens\n", (int) mToProcess.size(), (int) sln, (int) numTokens);
 
     return sln;
 }
@@ -1790,14 +1794,14 @@ bool BatchSequenceReader<ElemType>::GetMinibatchData(size_t& /*out*/ firstPosInS
 #ifdef _MSC_VER // make some old configurations reproducable (m_cacheBlockSize used to be a constant)  --TODO: remove in a few months
         if (m_cacheBlockSize == 50000)
         {
+            srand(++m_randomSeed); // TODO: older code did not have that; so no idea what random seed was used
             std::random_shuffle(m_parser.mSentenceIndex2SentenceInfo.begin(), m_parser.mSentenceIndex2SentenceInfo.end());
             // Note: random_shuffle is deprecated since C++14.
         }
         else // new configs use a wider randomization
 #endif
         {
-            std::random_device rd;
-            std::mt19937 g(rd());
+            std::mt19937 g(++m_randomSeed); // random seed is initialized to epoch, but gets incremented for intermediate reshuffles
             std::shuffle(m_parser.mSentenceIndex2SentenceInfo.begin(), m_parser.mSentenceIndex2SentenceInfo.end(), g);
         }
 
@@ -1845,20 +1849,20 @@ bool BatchSequenceReader<ElemType>::GetMinibatchData(size_t& /*out*/ firstPosInS
             // generate the output label token
             if (labelOut.type != labelNone)
             {
-                const auto& labelValue = m_labelTemp[pos];
+                const auto& labelValue2 = m_labelTemp[pos];
                 LabelIdType labelId;
                 if (labelOut.type == labelCategory)
                 {
                     pos++; // consume it   --TODO: value is not used after this
-                    labelId = GetIdFromLabel(labelValue, labelOut);
+                    labelId = GetIdFromLabel(labelValue2, labelOut);
                 }
                 else if (nextWord)
                 {
                     // this is the next word (pos was already incremented above when reading out labelValue)
-                    if (EqualCI(labelValue, labelIn.endSequence)) // end symbol may differ between input and output
+                    if (EqualCI(labelValue2, labelIn.endSequence)) // end symbol may differ between input and output
                         labelId = GetIdFromLabel(labelIn.endSequence, labelIn);
                     else
-                        labelId = GetIdFromLabel(labelValue, labelIn);
+                        labelId = GetIdFromLabel(labelValue2, labelIn);
                 }
                 else
                     LogicError("Unexpected output label type."); // should never get here
@@ -1885,7 +1889,7 @@ bool BatchSequenceReader<ElemType>::GetMinibatchData(size_t& /*out*/ firstPosInS
 //  - up to N sequences of the same length are returned in each MB
 //     - minibatches consist of sequences of the same length only (no gaps)
 template <class ElemType>
-bool BatchSequenceReader<ElemType>::GetMinibatch(StreamMinibatchInputs& matrices)
+bool BatchSequenceReader<ElemType>::TryGetMinibatch(StreamMinibatchInputs& matrices)
 {
     // get out if they didn't call StartMinibatchLoop() first
     // TODO: Why not fail here?
@@ -2019,7 +2023,7 @@ bool BatchSequenceReader<ElemType>::GetMinibatch(StreamMinibatchInputs& matrices
 timePos: the time position. for example, 100 actual minibatch with 10 streams,
 timePosition = [0,..,9] for each actual tiem
 */
-// This function was only called from BatchSequenceReader::GetMinibatch(), but no longer.
+// This function was only called from BatchSequenceReader::TryGetMinibatch(), but no longer.
 template <class ElemType>
 void BatchSequenceReader<ElemType>::SetSentenceBegin(int wrd, int uttPos, int timePos)
 {
@@ -2166,11 +2170,10 @@ void BatchSequenceReader<ElemType>::GetLabelOutput(StreamMinibatchInputs& matric
         }
 #endif
     }
-    // send it back to the GPU if so desired
-    // We have a special hack here to keep it on the CPU because we know that something is inefficient later.
-    // TODO: No! Readers should not have such knowledge.
-    if (curDevId != CPUDEVICE && readerMode != ReaderMode::Class)
-        labels.TransferFromDeviceToDevice(CPUDEVICE, curDevId, false, false, false);
+    // send it back to where it came from
+    // Note: This may leave this object in BOTH locations, which is desirable for
+    // class-based models which access the information on the CPU.
+    labels.TransferFromDeviceToDevice(CPUDEVICE, curDevId, false, false, false);
 }
 
 #if 0

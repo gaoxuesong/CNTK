@@ -9,44 +9,42 @@
 
 namespace Microsoft { namespace MSR { namespace CNTK {
 
+struct Index;
+
 // Base class for data deserializers.
 // Has a default implementation for a subset of methods.
 class DataDeserializerBase : public IDataDeserializer
 {
 public:
-    DataDeserializerBase() : m_sequencesInitialized(false)
+    DataDeserializerBase(bool primary) : m_primary(primary)
     {}
 
-    // Provides description of all sequences the deserializer can produce.
-    const SequenceDescriptions& GetSequenceDescriptions() const override
+    virtual bool GetSequenceDescription(const SequenceDescription& primary, SequenceDescription& result) override
     {
-        if (!m_sequencesInitialized)
-        {
-            FillSequenceDescriptions(m_sequences);
-            m_sequencesInitialized = true;
-        }
-        return m_sequences;
+        return GetSequenceDescriptionByKey(primary.m_key, result);
     }
 
-    virtual const SequenceDescription* GetSequenceDescriptionByKey(const KeyType&) override
+    virtual std::vector<StreamDescriptionPtr> GetStreamDescriptions() const override
+    {
+        return m_streams;
+    }
+
+protected:
+    virtual bool GetSequenceDescriptionByKey(const KeyType&, SequenceDescription&)
     {
         NOT_IMPLEMENTED;
     }
 
-protected:
-    // Fills the timeline with sequence descriptions.
-    // Inherited classes should provide the complete Sequence descriptions for all input data.
-    virtual void FillSequenceDescriptions(SequenceDescriptions& timeline) const = 0;
+    bool GetSequenceDescriptionByKey(const Index& index, const KeyType& key, SequenceDescription& r);
 
     // Streams this data deserializer can produce.
     std::vector<StreamDescriptionPtr> m_streams;
 
-private:
-    DataDeserializerBase(const DataDeserializerBase&) = delete;
-    DataDeserializerBase& operator=(const DataDeserializerBase&) = delete;
+    // Flag, indicating if the deserializer is primary.
+    const bool m_primary;
 
-    mutable SequenceDescriptions m_sequences;
-    mutable bool m_sequencesInitialized;
+private:
+    DISABLE_COPY_AND_MOVE(DataDeserializerBase);
 };
 
 }}}

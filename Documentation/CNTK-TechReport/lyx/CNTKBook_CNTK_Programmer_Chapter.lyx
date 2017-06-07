@@ -2510,7 +2510,7 @@ void DoTrain(const ConfigParameters& config)
 
 \begin_layout Plain Layout
 
-    int traceLevel = configSGD("traceLevel", "0");
+    int traceLevel = configSGD("traceLevel", 0);
 \end_layout
 
 \begin_layout Plain Layout
@@ -3132,11 +3132,6 @@ virtual void Validate()
 \begin_layout Plain Layout
 
 {             
-\end_layout
-
-\begin_layout Plain Layout
-
-    PrintSelfBeforeValidation();
 \end_layout
 
 \begin_layout Plain Layout
@@ -4145,7 +4140,7 @@ virtual void Evaluate(NDLNode<ElemType>* node, const wstring& baseName,
 
 \end_inset
 
-function in the SynchronousExecutionEngine.h file to handle special parameters.
+function in the NDLNetworkBuilder.h file to handle special parameters.
  
 \end_layout
 

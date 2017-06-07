@@ -21,7 +21,7 @@
 namespace Microsoft { namespace MSR { namespace CNTK {
 
 template <class ElemType>
-class HTKMLFReader : public IDataReader
+class HTKMLFReader : public DataReaderBase
 {
 private:
     const static size_t m_htkRandomizeAuto = 0;
@@ -40,9 +40,10 @@ private:
     intargvector m_numSeqsPerMBForAllEpochs;
     size_t m_numSeqsPerMB;      // requested number of parallel sequences
     size_t m_mbNumTimeSteps;    // number of time steps  to fill/filled (note: for frame randomization, this the #frames, and not 1 as later reported)
-    size_t m_mbMaxNumTimeSteps; // max time steps we take in a MB layout; any setence longer than this max will be discarded (and a warning will be issued )
+    size_t m_mbMaxNumTimeSteps; // max time steps we take in a MB layout; any sentence longer than this max will be discarded (and a warning will be issued )
                                 // this is used to prevent CUDA out-of memory errors
 
+    size_t m_maxUtteranceLength;         // the maximum frame number in one utterance. the default vaule is 10000.
     vector<size_t> m_numFramesToProcess; // [seq index] number of frames available (left to return) in each parallel sequence
     vector<size_t> m_switchFrame;        // TODO: something like the position where a new sequence starts; still supported?
     vector<size_t> m_numValidFrames;     // [seq index] valid #frames in each parallel sequence. Frames (s, t) with t >= m_numValidFrames[s] are NoInput.
@@ -96,6 +97,7 @@ private:
     size_t m_inputFileIndex;
     std::vector<size_t> m_featDims;
     std::vector<size_t> m_labelDims;
+    std::vector<bool> m_expandToUtt; // support for i-vector type of input - single fram should be applied to entire utterance
 
     std::vector<std::vector<std::vector<ElemType>>> m_labelToTargetMapMultiIO;
 
@@ -116,7 +118,7 @@ private:
 
     bool ReNewBufferForMultiIO(size_t i);
 
-    size_t GetNumParallelSequences();
+    size_t GetNumParallelSequencesForFixingBPTTMode();
     void SetNumParallelSequences(const size_t){};
 
     template <class ConfigRecordType>
@@ -151,6 +153,7 @@ public:
     HTKMLFReader()
         : m_pMBLayout(make_shared<MBLayout>())
     {
+        m_pMBLayout->SetUniqueAxisName(L"HTKMLFReader");
     }
     template <class ConfigRecordType>
     void InitFromConfig(const ConfigRecordType&);
@@ -182,7 +185,7 @@ public:
 
     virtual void StartDistributedMinibatchLoop(size_t mbSize, size_t epoch, size_t subsetNum, size_t numSubsets, size_t requestedEpochSamples = requestDataSize) override;
 
-    virtual bool GetMinibatch(StreamMinibatchInputs& matrices);
+    virtual bool TryGetMinibatch(StreamMinibatchInputs& matrices);
     virtual const std::map<LabelIdType, LabelType>& GetLabelMapping(const std::wstring& sectionName);
     virtual void SetLabelMapping(const std::wstring& sectionName, const std::map<LabelIdType, LabelType>& labelMapping);
     virtual bool GetData(const std::wstring& sectionName, size_t numRecords, void* data, size_t& dataBufferSize, size_t recordStart = 0);
@@ -195,6 +198,9 @@ public:
     void SetSentenceEnd(int /*actualMbSize*/){};
     void SetRandomSeed(int){NOT_IMPLEMENTED};
 
-    //bool RequireSentenceSeg() const override { return !m_frameMode; };
+    size_t GetCurrentSamplePosition() override
+    {
+        return m_mbiter->currentmbstartframe();
+    }
 };
 } } }

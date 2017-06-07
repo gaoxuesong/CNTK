@@ -8,9 +8,6 @@
 #include "../../../Source/Math/GPUMatrix.h"
 #include "../../Common/Include/fileutil.h"
 #include "../../Common/Include/File.h"
-// ToDo: CPP files directly included, use common library in the future if possible
-#include "../../Common/File.cpp"
-#include "../../Common/fileutil.cpp"
 
 #include <string>
 
@@ -41,7 +38,7 @@ BOOST_FIXTURE_TEST_CASE(MatrixFileWriteRead, RandomSeedFixture)
 {
     // Test Matrix in Dense mode
     Matrix<float> matrix = Matrix<float>::RandomUniform(43, 10, c_deviceIdZero, - 26.3f, 30.2f, IncrementCounter());
-    Matrix<float> matrixCopy = matrix;
+    Matrix<float> matrixCopy = matrix.DeepClone();
 
     std::wstring fileName(L"M.txt");
     File file(fileName, fileOptionsText | fileOptionsReadWrite);
@@ -56,7 +53,7 @@ BOOST_FIXTURE_TEST_CASE(MatrixFileWriteRead, RandomSeedFixture)
 
     // Test Matrix in Sparse mode
     Matrix<float> matrixSparse = Matrix<float>::RandomUniform(43, 10, c_deviceIdZero, - 26.3f, 30.2f, IncrementCounter());
-    Matrix<float> matrixSparseCopy = matrixSparse;
+    Matrix<float> matrixSparseCopy = matrixSparse.DeepClone();
 
     matrixSparse.SwitchToMatrixType(MatrixType::SPARSE, matrixFormatSparseCSR, true);
 

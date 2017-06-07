@@ -1,9 +1,8 @@
 dataDir: ../../Data
 tags:
-     # running on every BVT job in 'P' (Speech) leg in Debug-GPU and Release-CPU configurations:
-     - bvt-p  ((build_sku == 'gpu') or (build_sku == '1bitsgd')) and ((flavor=='debug') ^ (device=='cpu'))
-     # running unconditionally on every Nightly job in 'P' leg
+     - bvt-p ((build_sku == 'gpu') or (build_sku == '1bitsgd')) and ((flavor == 'release') if (os == 'windows') else ((flavor == 'debug') ^ (device == 'cpu')))
      - nightly-p ((build_sku == 'gpu') or (build_sku == '1bitsgd'))
+     - weekly-p ((build_sku == 'gpu') or (build_sku == '1bitsgd'))
 
 testCases:
   Must train epochs in exactly same order and parameters for each MPI Rank:
@@ -17,33 +16,33 @@ testCases:
     patterns:
       - ^MPI Rank {{integer}}
       - Finished Epoch[{{integer}} of {{integer}}]
-      - Training Set
-      - TrainLossPerSample = {{float,tolerance=0%}}
-      - EvalErrPerSample = {{float,tolerance=0%}}
-      - AvgLearningRatePerSample = {{float,tolerance=0.001%}}
+      - Training
+      - CrossEntropyWithSoftmax = {{float,tolerance=0%}}
+      - EvalClassificationError = {{float,tolerance=0.00000001}}
+      - learningRatePerSample = {{float,tolerance=0.001%}}
 
   Epochs must be finished with expected results for each MPI Rank for CV:
     patterns:
       - ^MPI Rank {{integer}}
       - Finished Epoch[{{integer}} of {{integer}}]
-      - Validation Set
-      - TrainLossPerSample = {{float,tolerance=0%}}
-      - EvalErrPerSample = {{float,tolerance=0%}}
+      - Validate
+      - CrossEntropyWithSoftmax = {{float,tolerance=0%}}
+      - EvalClassificationError = {{float,tolerance=0.00000001}}
 
   Per-minibatch training results must match for each MPI Rank:
     patterns:
       - ^MPI Rank {{integer}}
       - Epoch[{{integer}} of {{integer}}]-Minibatch[{{integer}}-{{integer}}
-      - SamplesSeen = {{integer}}
-      - TrainLossPerSample = {{float,tolerance=0%}}
-      - EvalErr[0]PerSample = {{float,tolerance=0%}}
+      - " * {{integer}}; "
+      - CrossEntropyWithSoftmax = {{float,tolerance=0%}}
+      - EvalClassificationError = {{float,tolerance=0.00000001}}
 
   DataParallelSGD training parameters must match for each MPI Rank:
     patterns:
       - ^MPI Rank {{integer}}
       - Starting minibatch loop
       - DataParallelSGD training
-      - MyRank = {{integer}}
-      - NumNodes = 2
-      - NumGradientBits = 64
+      - myRank = {{integer}}
+      - numNodes = 2
+      - numGradientBits = 64
       - distributed reading is ENABLED
